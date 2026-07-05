@@ -1,0 +1,616 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true, linkcolor=blue!60!black, citecolor=blue!60!black,
+            urlcolor=blue!60!black}
+
+\newcommand{\eps}{\varepsilon}
+\newcommand{\lm}{\lambda_{\ell m}}
+\newcommand{\cth}{\cos\theta}
+\newcommand{\sth}{\sin\theta}
+
+\title{\textbf{Almond}: a GPU spherical-harmonic transform for HEALPix\\
+{\large Mathematical techniques and technical design}}
+\author{PowerSpec / SiMaster project}
+\date{July 2026 (prototype v0.1: spin-0 synthesis)}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+\textbf{Almond} is a CUDA implementation of the spherical-harmonic transform
+(SHT) on HEALPix grids, intended to replace the CPU library \texttt{ducc0}
+as the SHT backend of the SiMaster quadratic maximum-likelihood (QML) power
+spectrum estimator.  It implements, on the GPU, the same
+exact algorithm as \texttt{ducc0} (the libsharp2 lineage): double precision
+throughout, healpy conventions, matrix-free, with the every-other-$\ell$
+Legendre recursion, $2^{\pm800}$ dynamic-range scaling, and per-ring FFT-bin
+aliasing.  \texttt{ducc0} is the correctness reference; the prototype
+achieves $\lesssim 10^{-11}$ maximum relative deviation from it.  This
+document derives the algorithm, records the design decisions and their
+GPU-specific rationale, and reports benchmark results on NERSC Perlmutter
+A100 nodes.
+\end{abstract}
+
+\tableofcontents
+
+%==============================================================================
+\section{Problem statement and conventions}
+
+A real spin-0 field sampled on a HEALPix RING grid of resolution
+$N_\mathrm{side}$ is synthesised from harmonic coefficients as
+\begin{equation}
+f(\theta,\varphi) \;=\; \sum_{\ell=0}^{\ell_{\max}} \sum_{m=-\ell}^{\ell}
+   a_{\ell m}\, Y_{\ell m}(\theta,\varphi),
+\qquad
+Y_{\ell m}(\theta,\varphi) = \lm(\theta)\, e^{im\varphi},
+\end{equation}
+where $\lm$ are the fully normalised associated Legendre functions
+($\int |Y_{\ell m}|^2 d\Omega = 1$).  healpy stores only $m \ge 0$; reality
+implies $a_{\ell,-m} = (-1)^m a_{\ell m}^{*}$ and
+$\lambda_{\ell,-m} = (-1)^m \lm$.  The triangular healpy layout indexes
+$a_{\ell m}$ at $\mathrm{mstart}(m) + \ell$ with
+$\mathrm{mstart}(m) = m(2\ell_{\max}+1-m)/2$.  Following
+\texttt{ducc0}/healpy, the imaginary part of $a_{\ell 0}$ is ignored.
+
+HEALPix RING geometry places pixels on $4N_\mathrm{side}-1$ iso-latitude
+rings; ring $i$ ($1 \le i \le 4N_\mathrm{side}-1$, north to south) has
+\begin{equation}
+n_\varphi(i) = \begin{cases} 4i' & \text{polar caps } (i' < N_\mathrm{side})\\
+4N_\mathrm{side} & \text{equatorial belt} \end{cases}
+\qquad
+\varphi_j = \varphi_0(i) + \frac{2\pi j}{n_\varphi},
+\end{equation}
+with $i' = \min(i, 4N_\mathrm{side}-i)$, and $\cth$ an exact rational:
+$1 - i'^2/(3N_\mathrm{side}^2)$ in the caps,
+$4/3 - 2i/(3N_\mathrm{side})$ in the belt.  We compute $\cth$, $\sth$
+directly from these rationals (never through $\theta=\arccos z$), and
+$\varphi_0 = \pi q/d$ with small integers $(q,d)$ --- both facts are
+exploited for accuracy (\S\ref{sec:fold}).
+
+The transform factorises over rings:
+\begin{equation}
+F_m(\theta) \;=\; \sum_{\ell=m}^{\ell_{\max}} a_{\ell m}\, \lm(\theta),
+\qquad
+f(\theta,\varphi_j) \;=\; \sum_{m=-\ell_{\max}}^{\ell_{\max}}
+   F_m(\theta)\, e^{im\varphi_j},
+\quad F_{-m} = F_m^{*}.
+\label{eq:factorize}
+\end{equation}
+Stage 1 (\emph{Legendre}, $O(N_\mathrm{ring}\,\ell_{\max}^2)$ work) computes
+$F_m$ on every ring; stage 2 (\emph{FFT}, $O(N_\mathrm{pix}\log
+N_\mathrm{side})$) evaluates the azimuthal sums.  Stage 1 dominates at all
+resolutions of interest.
+
+%==============================================================================
+\section{Stage 1: the every-other-$\ell$ Legendre recursion}
+\label{sec:legendre}
+
+\subsection{Three-term recurrence and ring pairing}
+
+The normalised Legendre functions obey
+\begin{equation}
+\cth\, \lm = \eps_{\ell+1}\lambda_{\ell+1,m} + \eps_{\ell}\lambda_{\ell-1,m},
+\qquad
+\eps_\ell = \sqrt{\frac{\ell^2 - m^2}{4\ell^2 - 1}},
+\label{eq:threeterm}
+\end{equation}
+seeded by $\lambda_{mm}(\theta) = c_m \sth^m$,
+$c_m = (-1)^m\sqrt{(2m+1)!!/(4\pi\,(2m)!!)}$, and
+$\lambda_{m-1,m}=0$.  The parity relation
+$\lm(\pi-\theta) = (-1)^{\ell+m}\lm(\theta)$ makes it natural to process
+rings in north/south pairs sharing $|\cth|$: splitting the sum in
+\eqref{eq:factorize} into even and odd $\ell-m$,
+\begin{equation}
+S_e = \!\!\sum_{\ell-m\ \mathrm{even}}\!\! a_{\ell m}\lm, \qquad
+S_o = \!\!\sum_{\ell-m\ \mathrm{odd}}\!\! a_{\ell m}\lm, \qquad
+F_m^{\rm north} = S_e + S_o,\quad F_m^{\rm south} = S_e - S_o .
+\label{eq:evenodd}
+\end{equation}
+This halves the Legendre work.  The HEALPix equator ring is self-paired
+($\cth=0$).
+
+\subsection{Folding the odd $\ell$ into the even stream}
+\label{sec:fold-l}
+
+\texttt{ducc0}'s key trick (inherited here) is to visit only every other
+$\ell$ in the $\theta$ recursion.  Write $n_{i} = m + 2i + 1$ for the odd
+offsets, $x = \cos^2\theta$.  Applying \eqref{eq:threeterm} twice gives a
+pure $\Delta\ell = 2$ recurrence,
+\begin{equation}
+\lambda_{n+2} \;=\;
+\frac{(x - \eps_n^2 - \eps_{n+1}^2)\,\lambda_{n}
+      \;-\; \eps_{n-1}\eps_{n}\,\lambda_{n-2}}{\eps_{n+1}\,\eps_{n+2}} .
+\label{eq:delta2}
+\end{equation}
+Introduce scaled variables $\mu_i$ and per-$m$ constants $\alpha_i$:
+\begin{equation}
+\mu_i \;=\; \frac{\lambda_{n_i}}{\alpha_i \cth},
+\qquad
+\alpha_0 = \frac{1}{\eps_{m+1}},\qquad
+\alpha_{i+1} = \frac{\sigma_i}{\eps_{n_i+1}\,\eps_{n_i+2}\,\alpha_i},
+\qquad \sigma_i = (-1)^{i} .
+\label{eq:alpha}
+\end{equation}
+Then \eqref{eq:delta2} becomes a recurrence with \emph{unit} trailing
+coefficient --- one FMA for the polynomial, one for the update:
+\begin{equation}
+\boxed{\;\mu_{i+1} = (a_i\,x + b_i)\,\mu_i + \mu_{i-1}\;},
+\qquad
+a_i = \sigma_i\,\alpha_i^2,\qquad
+b_i = -a_i\,(\eps_{n_i}^2 + \eps_{n_i+1}^2),
+\label{eq:murec}
+\end{equation}
+with exact initial conditions $\mu_{-1} = 0$ and
+$\mu_0 = \lambda_{mm}$ (because $\lambda_{m+1,m} = \cth\,\lambda_{mm}/
+\eps_{m+1}$).  The $\alpha_i$ carry the sign pattern
+$(+,+,-,-,+,+,\dots)$ of period four and $|\alpha_i| = \sqrt{|a_i|}$, which
+the implementation uses to reconstruct $\alpha$ from the stored $a$
+(\S\ref{sec:tables}).  Note that $\cth$ never appears in a denominator: at
+the equator the recursion runs on finite $\mu_i$ even though
+$\lambda_{n_i}(\pi/2) = 0$.
+
+Both partial sums come out of the \emph{same} $\mu$ sequence.  Pre-fold the
+coefficients once per transform ($O(\ell_{\max}^2)$ total, embarrassingly
+parallel):
+\begin{equation}
+A_i = \alpha_i\left(\eps_{n_i}\, a_{n_i-1,m} + \eps_{n_i+1}\, a_{n_i+1,m}\right),
+\qquad
+B_i = \alpha_i\, a_{n_i,m} .
+\label{eq:prefold}
+\end{equation}
+Using \eqref{eq:threeterm} and reindexing (all boundary terms vanish since
+$\lambda_{m-1,m}=0$),
+\begin{equation}
+\sum_i \mu_i A_i
+ = \frac{1}{\cth}\sum_{\ell-m\,\mathrm{even}} a_{\ell m}
+   \left(\eps_{\ell+1}\lambda_{\ell+1} + \eps_{\ell}\lambda_{\ell-1}\right)
+ = S_e,
+\qquad
+\cth \sum_i \mu_i B_i = S_o .
+\end{equation}
+Hence, per ring pair and per $m$,
+\begin{equation}
+p_1 = \sum_i \mu_i A_i,\quad p_2 = \sum_i \mu_i B_i,
+\qquad
+F_m^{\rm north} = p_1 + \cth\, p_2,\quad
+F_m^{\rm south} = p_1 - \cth\, p_2 .
+\end{equation}
+Cost: covering two $\ell$'s takes 2 real FMAs of recursion and 4 of
+accumulation ($p_{1,2}$ complex) --- \emph{3 flops per $(\mathrm{ring\,pair},
+m,\ell)$}, vs.\ 4--6 for the naive $\Delta\ell=1$ recursion, with half the
+serial dependency chain.
+
+\subsection{Dynamic range: $2^{\pm 800}$ scaling}
+\label{sec:scaling}
+
+$\lambda_{mm} \propto \sth^m$ underflows double precision catastrophically
+near the poles ($\sth^{6000}$ at $N_\mathrm{side}=2048$ polar rings can be
+$10^{-10^{4}}$).  Two devices (both from \texttt{ducc0}):
+
+\begin{itemize}
+\item \textbf{Scaled representation.}  A value is stored as
+  $(v, s)$ meaning $v \cdot 2^{800 s}$ with $|v|$ kept below
+  $2^{-60}$; the seed $\sth^m$ is computed by binary exponentiation in this
+  representation (\texttt{mypow}, $O(\log m)$ multiplies --- accurate to
+  $\sim\!10^{-15}$ where naive \texttt{pow} would lose $m\cdot$ulp).  While
+  $s<0$ the true value is $< 2^{-860}$ and contributes exactly $0$ at double
+  precision: the GPU thread advances the recursion \emph{without
+  accumulating} and re-scales ($v\!\cdot\!2^{-800}$, $s{+}{+}$) whenever
+  $|v|$ exceeds $2^{-60}$.  Once $s=0$ the thread switches permanently to
+  the plain FMA loop (\S\ref{sec:kernel}); normalised $\lm$ are bounded by
+  $\sim\!\ell^{1/4}$ so no overflow re-scaling is ever needed there.
+\item \textbf{$m$ cutoff.}  On a ring with $\sth$ small, all $m >
+  m_\mathrm{lim}(\theta) \approx \ell_{\max}\sth + \max(100,
+  0.01\,\ell_{\max})$ give $F_m$ below double-precision relevance; those
+  $(\mathrm{ring},m)$ pairs are skipped entirely and their $F_m$ set to $0$
+  (identical rule to \texttt{ducc0}, so agreement with the reference is
+  exact).  This removes $\sim 30\%$ of the Legendre work.
+\end{itemize}
+
+\subsection{GPU kernel design}
+\label{sec:kernel}
+
+CPU \texttt{ducc0} vectorises over rings within a SIMD register (AVX
+lanes share one coefficient stream) and threads over $m$.  The GPU analogue
+maps \textbf{one thread to two adjacent (ring pair, $m$) chains}:
+
+\begin{itemize}
+\item Grid: $y$-dimension $= m \in [0, m_{\max}]$; $x$-dimension covers
+  the $2N_\mathrm{side}$ ring pairs in blocks of 128 threads.  At
+  $N_\mathrm{side}=2048$ this is $\sim\!2\cdot10^5$ blocks / $2.5\cdot10^7$
+  threads, each running $(\ell_{\max}-m)/2$ recursion steps: ample
+  parallelism, and the strongly $m$-dependent trip count is absorbed by the
+  block scheduler.
+\item All threads of a block share one $(A_i, B_i, a_i, b_i)$ stream
+  ($48$\,B per $i$): the loads are uniform across the block and hit L1/L2
+  broadcast; per-transform DRAM traffic from the tables is a single
+  $\sim\!0.45$\,GB stream at $N_\mathrm{side}=2048$ ($\sim$0.3\,ms at HBM
+  bandwidth).  No shared memory is needed.
+\item Each thread keeps $\mu_i,\mu_{i-1}$, the four accumulators
+  $\mathrm{Re}/\mathrm{Im}(p_1,p_2)$, $x=\cos^2\theta$ and $\cth$ in
+  registers.  The inner loop is unrolled two-fold like \texttt{ducc0}'s
+  (\eqref{eq:murec} alternating the roles of $\mu_i/\mu_{i-1}$, avoiding a
+  swap).
+\item \textbf{Two ring pairs per thread.}  The $\mu$ recursion is a serial
+  chain of two dependent FMAs per step ($\sim$8 cycles), against which each
+  step offers only four independent accumulation FMAs --- one chain per
+  thread cannot hide the latency even at full occupancy (measured
+  $\sim$28\% of fp64 peak).  Giving each thread two \emph{adjacent} ring
+  pairs (nearly equal $\theta$, hence near-identical $m_\mathrm{lim}$ and
+  scale-emergence points) doubles the independent FMA streams per thread
+  and amortises the shared coefficient loads, the exact GPU analogue of
+  \texttt{ducc0}'s SIMD-over-rings: measured $1.45\times$ on the Legendre
+  stage (66 registers, no spills).  The pair that surfaces earlier is
+  advanced solo over the short gap, then both run in one fused loop.
+\item Warp divergence from the scaled start-up phase is mild: threads in a
+  block are neighbouring rings, whose emergence $\ell$ differs little; the
+  $m_\mathrm{lim}$ skip retires whole warps at once (rings are ordered
+  pole$\to$equator).
+\item The flop budget at $N_\mathrm{side}=2048$, $\ell_{\max}=6143$:
+  $2N_\mathrm{side}\cdot\frac14\ell_{\max}^2 \cdot 12 \approx 3.7\cdot10^{11}$
+  flops (before the $\sim$30\% $m_\mathrm{lim}$ saving); A100 fp64 peak
+  (non-tensor) is $9.7$\,Tflop/s.
+\end{itemize}
+
+The $(a_i,b_i)$ table is built once per plan by a tiny kernel (one thread
+per $m$, sequential in $i$ --- the $\alpha$ recursion \eqref{eq:alpha} is
+serial); the $(A_i,B_i)$ pre-fold \eqref{eq:prefold} runs per transform
+with one thread per $(m,i)$, reconstructing
+$\alpha_i = \mathrm{sign}_4(i)\sqrt{|a_i|}$ and computing $\eps$ on the fly.
+\label{sec:tables}
+
+%==============================================================================
+\section{Stage 2: aliasing fold and per-ring inverse FFT}
+\label{sec:fold}
+
+Ring values follow from \eqref{eq:factorize}.  With $n \equiv n_\varphi$
+pixels, $e^{im\varphi_j} = e^{im\varphi_0} e^{2\pi i\, jm/n}$ and
+$e^{2\pi i\,jm/n}$ depends only on $k = m \bmod n$: every $F_m$ is
+\emph{aliased} onto FFT bin $k$.  At $\ell_{\max} = 3N_\mathrm{side}-1$
+this matters on \emph{all} rings, including the belt
+($4N_\mathrm{side} < 2\ell_{\max}+1$).  The fold kernel computes, per ring,
+\begin{equation}
+G_k \;=\; \sum_{m \equiv k \ (\mathrm{mod}\ n)} t_m
+     \;+\; \sum_{m \equiv -k \ (\mathrm{mod}\ n),\, m>0} t_m^{*},
+\qquad t_m = F_m e^{im\varphi_0},
+\end{equation}
+(one thread per (ring, $m \le m_\mathrm{lim}$), \texttt{atomicAdd} into
+$G$; the two conjugate contributions make $G$ Hermitian so the inverse DFT
+$f_j = \sum_k G_k e^{2\pi i jk/n}$ is real).  $\mathrm{Im}\,F_0$ is
+discarded, matching \texttt{ducc0}.
+
+\textbf{Twiddle accuracy.}  $m\varphi_0$ can reach $\sim\!5000$ rad; naive
+\texttt{sincos} of the rounded product would cost $\sim\!m\cdot$ulp of
+phase.  Since $\varphi_0 = \pi q/d$ with integers $(q,d)$
+($q{=}1, d{=}4i'$ in the caps; $q\in\{0,1\}, d{=}4N_\mathrm{side}$ in the
+belt), we reduce $mq \bmod 2d$ \emph{in integer arithmetic} and call
+\texttt{sincospi} --- the twiddle is then accurate to $\sim$1 ulp for every
+$m$.  The same trick seeds the cap DFT rotations.
+
+\textbf{Belt rings} all share $n = 4N_\mathrm{side}$ and are contiguous in
+the RING map layout, so a single batched cuFFT inverse c2c transform of
+shape $(2N_\mathrm{side}{+}1,\, 4N_\mathrm{side})$ evaluates them; a
+trailing elementwise kernel writes $n\,\mathrm{Re}(\cdot)$ straight into
+the map segment.
+
+\textbf{Cap rings} have $n = 4, 8, \dots, 4(N_\mathrm{side}{-}1)$ --- all
+different, awkward for cuFFT (thousands of tiny plans/launches).  Two
+paths:
+
+\emph{Small rings} ($i < 64$; negligible pixel count): direct Hermitian
+inverse DFT,
+\begin{equation}
+f_j = G_0 + (-1)^j G_{n/2}
+   + 2\sum_{k=1}^{n/2-1} \mathrm{Re}\!\left(G_k\, e^{2\pi i jk/n}\right),
+\end{equation}
+one thread per pixel, rotating $e^{2\pi i jk/n}$ incrementally and
+re-seeding it exactly (integer-reduced \texttt{sincospi}) every 128 steps,
+which bounds the phase drift at $\sim\!10^{-14}$.  (Applied to \emph{all}
+cap rings this kernel is $O(N_\mathrm{side}^3)$ and was $\sim$60\% of the
+transform at $N_\mathrm{side}=2048$; it survives only for the tiny rings
+where Bluestein padding would be wasteful.)
+
+\emph{All other cap rings}: Bluestein's algorithm through batched cuFFT.
+With chirps $w_t = e^{i\pi t^2/n}$ (computed exactly: $t^2 \bmod 2n$ in
+integers, then \texttt{sincospi}),
+\begin{equation}
+f_j \;=\; w_j \sum_{k} \left(G_k w_k\right)\, \bar w_{j-k},
+\end{equation}
+a linear convolution evaluated as a circular one of power-of-two length
+$M \ge 2n-1$.  Rings are grouped into size classes
+$i \in [2^j, 2^{j+1})$ sharing $M = 2^{j+4}$, so \emph{one} batched
+cuFFT pair (forward + inverse) per class handles a whole hemisphere pair
+population; the FFTs of the chirp kernels $\hat b$ are precomputed at plan
+build (715\,MB at $N_\mathrm{side}=2048$).  This replaces the
+$O(N_\mathrm{side}^3)$ cap cost by $O(N_\mathrm{side}^2 \log
+N_\mathrm{side})$ and cut the $N_\mathrm{side}=2048$ transform from
+179\,ms to 112\,ms.
+
+%==============================================================================
+\section{Accuracy}
+\label{sec:accuracy}
+
+Correctness is defined as agreement with \texttt{ducc0}
+(\texttt{synthesis}, RING geometry from \texttt{Healpix\_Base.sht\_info()}).
+Because Almond implements the \emph{same} recursion, coefficients, scaling
+thresholds and $m_\mathrm{lim}$ rule, agreement is at the level of
+floating-point noncommutativity, not method error.  Gates in the test
+suite (random Gaussian $a_{\ell m}$, $\ell_{\max}=3N_\mathrm{side}-1$):
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+check & criterion & measured \\
+\midrule
+NumPy reference vs \texttt{ducc0}, $N_\mathrm{side}\!\le\!32$ &
+  $<10^{-12}$ & $\sim10^{-14}$ \\
+GPU vs \texttt{ducc0}, $N_\mathrm{side} = 8\ldots1024$ &
+  $<10^{-10}$ & \textit{(see \S\ref{sec:results})} \\
+call-to-call determinism (atomics reorder) & $\le10^{-13}$ & pass \\
+\bottomrule
+\end{tabular}
+\end{center}
+The transform is deterministic up to the order of the \texttt{atomicAdd}s
+in the fold stage, whose additions involve $\lesssim m_{\max}/n$ terms per
+bin; the observed call-to-call scatter is $\lesssim10^{-15}$ relative.
+
+A pure-NumPy reference implementation (\texttt{almond/reference.py}), ported
+line-by-line from \texttt{ducc0} and validated against it first, serves as
+the executable specification: every GPU kernel corresponds one-to-one to a
+block of that file, which made the CUDA port correct on first run.
+
+%==============================================================================
+\section{Memory budget}
+\label{sec:memory}
+
+Persistent device buffers of a plan at $(N_\mathrm{side}, \ell_{\max} =
+3N_\mathrm{side}-1)$, in double precision:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+buffer & size & $N_\mathrm{side}=2048$ \\
+\midrule
+coefficient table $(a,b)$ & $16\,\mathrm{B}\cdot\ell_{\max}^2/4$ & 151 MB \\
+pre-folded $(A,B)$        & $32\,\mathrm{B}\cdot\ell_{\max}^2/4$ & 302 MB \\
+phase $F_m(\mathrm{ring})$ & $16\,\mathrm{B}\,(m_{\max}{+}1)N_\mathrm{ring}$ & 805 MB \\
+FFT bins $G$              & $16\,\mathrm{B}\,N_\mathrm{pix}$ & 805 MB \\
+output map                & $8\,\mathrm{B}\,N_\mathrm{pix}$ & 403 MB \\
+Bluestein $\hat b$ tables & $\sim 16\,\mathrm{B}\cdot 43 N_\mathrm{side}^2$ & 715 MB \\
+\midrule
+total persistent          & & $\sim$3.2 GB \\
+transients (belt + Bluestein cuFFT) & & $\sim$1.8 GB \\
+\bottomrule
+\end{tabular}
+\end{center}
+plus the input $a_{\ell m}$ (302 MB) if resident.  Comfortable on a 40 GB
+A100 up to $N_\mathrm{side} = 4096$; the phase and $G$ buffers could be
+eliminated altogether by fusing the fold into the Legendre kernel
+(\S\ref{sec:future}).
+
+%==============================================================================
+\section{Benchmarks}
+\label{sec:results}
+
+Measured on a dedicated Perlmutter GPU node (A100-SXM 40\,GB; AMD EPYC
+7763, 64 physical cores), SLURM job 55427184.  Methodology: accuracy gate
+vs \texttt{ducc0} first; then median of $\ge$5--10 warm calls with
+\texttt{deviceSynchronize} around each; \texttt{ducc0} timed on the same
+node at 1/16/32/64 threads (best time reported); Almond timed both
+device-resident (the QML use case --- the CG solver keeps data on the GPU)
+and including host$\to$device$\to$host copies of $a_{\ell m}$ and the map.
+Random Gaussian $a_{\ell m}$, $\ell_{\max} = 3N_\mathrm{side}-1$, spin 0,
+single transform ($B=1$).
+
+\begin{center}
+\input{results_table}
+\end{center}
+
+\noindent Reading of the table:
+\begin{itemize}
+\item \textbf{Almond beats best-threaded (64-core) ducc0 at every resolution},
+  by $6.2\times$ at $N_\mathrm{side}=2048$ (77\,ms vs 479\,ms;
+  $250\times$ vs single-thread ducc0).  Against the QML-relevant
+  device-resident workload there is no CPU/GPU crossover to wait for ---
+  the GPU wins already at $N_\mathrm{side}=128$.
+\item Including PCIe copies the win shrinks to $1.2$--$3.1\times$:
+  transfers cost roughly as much as the transform itself at large
+  $N_\mathrm{side}$ (455\,MB round trip at $N_\mathrm{side}=2048$).
+  Batched/pipelined transfers or keeping data resident (SiMaster's mode)
+  are essential.
+\item Whole-map throughput at $N_\mathrm{side}=2048$:
+  $50.3\,\mathrm{Mpix} / 77\,\mathrm{ms} = 653$\,Mpix/s.  Stage split:
+  Legendre 65\,ms ($\sim$4\,Tflop/s, 40\% of A100 fp64 peak), Bluestein
+  caps 7.6\,ms, fold 4.9\,ms, belt cuFFT 3.3\,ms, pre-fold 0.6\,ms.
+\item Accuracy vs ducc0 degrades slowly with $\ell_{\max}$
+  ($1.9\times10^{-13} \to 5.6\times10^{-12}$), consistent with
+  floating-point noncommutativity of the fold atomics and the different
+  twiddle paths, far below the $10^{-8}$ science gate.
+\item Peak device memory (plan + transients): 5.0\,GB at
+  $N_\mathrm{side}=2048$, dominated by the phase/$G$ buffers and Bluestein
+  tables (\S\ref{sec:memory}); $N_\mathrm{side}=4096$ fits a 40\,GB A100.
+\end{itemize}
+
+\subsection{High-throughput batched comparison}
+\label{sec:batched}
+
+QML applies the SHT to many right-hand sides, and \texttt{ducc0}'s
+strongest many-transform configuration is not internal threading of one
+transform but its \texttt{ntrans} batch mode ($a_{\ell m}$ of shape
+$(B, 1, n_{\rm alm})$, one call, threads across the batch).  On few-core
+runs this mode is dramatically better per column than intra-transform
+threading (login-node check: $426 \to 41.6$\,ms/col from 1 to 16 threads at
+$N_\mathrm{side}=512$).  The honest throughput comparison is therefore
+per-column time at large $B$ against \texttt{ducc0}-ntrans at 64 threads
+(same dedicated node; Almond runs \texttt{synthesis\_device\_batch}):
+
+\begin{center}
+\input{batched_table}
+\end{center}
+
+Two findings.  First, on a full 64-core node \texttt{ducc0}'s batch mode is
+barely faster per column than its (well-implemented) intra-transform
+threading (461 vs 479\,ms/col at $N_\mathrm{side}=2048$): 64 concurrent
+CPU transforms saturate host memory bandwidth long before they saturate
+64 cores.  Almond's advantage in the throughput regime is therefore the same
+$\sim\!6\times$ as for single transforms, uniformly over
+$N_\mathrm{side} = 256$--$2048$ (1.4--3.1$\times$ if every batch crosses
+PCIe both ways).
+
+Second, a negative result on the GPU side: a chunked Legendre kernel that
+shares one $\mu$ recursion among $C$ columns (4$C$ accumulators per
+thread) \emph{loses} to simply looping the single-transform pipeline
+(11.7\,ms/col sequential vs 14.4--16.7\,ms/col for $C = 2$--$8$ at
+$N_\mathrm{side}=1024$): the accumulator registers destroy occupancy (150
+registers at $C=8$) and each column needs its own $(A_i,B_i)$ loads,
+doubling the relative L1 pressure, while the amortised recursion was only
+ever 4 of 12 flops per step.  The two-ring-pair kernel of
+\S\ref{sec:kernel} already owns the right trade: its two chains share one
+coefficient stream.  Ring pairs beat column chunks on the GPU for the same
+reason SIMD-over-rings beats SIMD-over-columns on the CPU.  The batched
+API therefore defaults to the looped single pipeline (asynchronous, no
+per-column synchronisation); the chunked kernel is retained behind
+\texttt{chunk>1} for future spin-2/adjoint experiments.
+
+%==============================================================================
+\section{Design decisions and departures from ducc0}
+\label{sec:departures}
+
+\texttt{ducc0} is aggressively CPU-shaped; porting it verbatim would waste
+the GPU.  What was kept, and what was changed:
+
+\begin{itemize}
+\item \textbf{Kept: the mathematics.}  Recursion \eqref{eq:murec},
+  pre-fold \eqref{eq:prefold}, scaling thresholds, $m_\mathrm{lim}$ ---
+  bit-compatible behaviour makes validation trivial and inherits 15 years
+  of numerical hardening.
+\item \textbf{Changed: parallel decomposition.}  CPU: SIMD over
+  $\sim$8--64 rings within one thread, OpenMP over $m$, ring-block cache
+  tiling (\texttt{lstep}) to keep $a_{\ell m}$ resident in L2.  GPU: one
+  thread per (ring pair, $m$), $2.5\cdot10^7$-way parallelism, no tiling
+  --- the coefficient streams are block-uniform loads that L1/L2 serve at
+  register speed, and the $\sim$150 MB tables are read once per transform
+  from HBM.
+\item \textbf{Changed: coefficient handling.}  \texttt{ducc0} recomputes
+  the per-$m$ coefficient vectors on each core inside the $m$ loop (cheap
+  on CPU, cache-resident).  We precompute the full triangular $(a,b)$
+  table once per plan (151 MB at $N_\mathrm{side}{=}2048$): GPU threads
+  cannot afford a serial per-$m$ preparation, and memory is cheaper than
+  divergence.  $\alpha_i$ is \emph{not} stored --- it is reconstructed as
+  $\mathrm{sign}_4(i)\sqrt{|a_i|}$, saving 75 MB.
+\item \textbf{Changed: FFT stage.}  \texttt{ducc0} runs pocketfft
+  ring-by-ring inside the OpenMP loop with FFTPACK-style half-complex
+  buffers.  We split by ring population: one batched cuFFT for the
+  $2N_\mathrm{side}{+}1$ equal-length belt rings, a direct Hermitian DFT
+  kernel for the caps, and exact-rational \texttt{sincospi} twiddles
+  instead of a cached \texttt{MultiExp} table.
+\item \textbf{Changed: precision management is per-thread scalar.}  The
+  SIMD-lane \texttt{corfac} machinery collapses to a simple three-phase
+  scalar loop (skip / unscale / plain FMA), which is both simpler and
+  divergence-friendly.
+\end{itemize}
+
+%==============================================================================
+\section{Adjoint synthesis and spin-2 (v0.2)}
+\label{sec:v02}
+
+\textbf{Adjoint} ($Y^\dagger$: map$\to$alm, ducc0's convention --- the
+transpose under the alm inner product that counts $m>0$ twice): per ring
+$\hat G_k = \sum_j f_j e^{-2\pi i jk/n}$ (cuFFT rfft on the belt,
+sign-flipped Bluestein on the caps), unfold
+$F'_m = e^{-im\varphi_0}\hat G_{m \bmod n}$ (with $\mathrm{Im}\,F'_0 \to
+0$), then the Legendre adjoint
+$A'_i = \sum_\mathrm{pairs} \mu_i\,(F'_N{+}F'_S)$,
+$B'_i = \sum_\mathrm{pairs} \mu_i \cth (F'_N{-}F'_S)$ and an
+$\alpha/\eps$-weighted gather to $a'_{\ell m}$.  The reduction kernel gives
+each $m$ one thread block owning \emph{all} ring pairs (chunk loop), so
+global accumulation needs no atomics: per step, contributions are
+warp-shuffle-reduced (4 lanes-worth of chains per lane) and staged in
+per-warp shared tiles flushed every 128 steps.  Validated against
+\texttt{ducc0.adjoint\_synthesis} to $<10^{-10}$ (nside 8--1024) and
+against Almond's own synthesis via the transpose identity to $10^{-12}$.
+Cost: $\sim$1.5--1.9$\times$ the synthesis (147 vs 77\,ms at
+$N_\mathrm{side}{=}2048$) --- the shuffle-reduction overhead.
+
+\textbf{Spin-2}: the native \texttt{ducc0} spin recursion (its
+spin-2-via-spin-0 shortcut with $1/\sin^2\theta$ ring weights is inexact
+near the poles; ducc itself reverts to the native path for
+$\sin\theta<0.01$).  Two scaled Wigner-$d$ chains
+$(\lambda^\pm \sim d^\ell_{m,\mp 2})$ advance with a $\Delta\ell=1$
+three-term recursion in $\cth$; eight accumulators build the $Q\pm iU$
+combinations with parity-interleaved $E/B$ coupling; initialisation uses
+half-angle power prefactors $\mathrm{prefac}(m)\,c^{a}s^{b}$ carried in the
+$2^{800}$-scaled representation.  Stage 2 (fold/FFT) is reused verbatim
+with the two components riding the batch-chunk axis.  Synthesis and
+adjoint validated against ducc0 to $<10^{-10}$ (nside 8--512).
+
+Two porting bugs are worth recording.  (i) prefac$(m)$ underflowed to
+exactly zero for $m \gtrsim 514$: the factorial-table \emph{ratios} need
+ducc's two-sided normalisation --- one-sided clamping assumes a direction
+values do not actually keep.  Same lesson as the \texttt{mypow} incident:
+port the invariant band, not the assumed monotonicity.  (ii) the spin
+adjoint requires \emph{conjugated} coefficients on the $\pm i$ cross terms
+(real-linear transpose: $y \mathrel{+}= c\,x \Rightarrow x' \mathrel{+}=
+\bar c\,y$).  Both were found by mode-range bisection against ducc0.
+
+\textbf{Measured} (dedicated A100-SXM + 64-core EPYC, job 55449334;
+device-resident, median of warm calls; ducc0 at 64 threads; accuracy gate
+passed in all cells):
+
+\begin{center}
+\input{v02_table}
+\end{center}
+
+\noindent The adjoint speedups ($\sim$3.2$\times$ spin-0, $\sim$1.7$\times$
+spin-2) trail the synthesis ($6.5\times$ / $\sim$3$\times$) because ducc0's
+adjoint costs the same as its synthesis while Almond's reduction kernels
+pay the shuffle overhead --- the known tuning target.
+
+\textbf{SiMaster integration}: \texttt{almond.simaster.AlmondRealSHT} is a
+validated drop-in for \texttt{simaster.sht.RealSHT} (real coefficient
+basis, observed-pixel subsetting, batched columns; numpy or cupy in/out),
+tested against it for spin 0 and 2 on a cut sky to $10^{-10}$ together
+with the real-basis transpose identity.
+
+\section{v0.3: fused fold, tuning, SiMaster integration}
+\label{sec:v03}
+
+The fold/unfold stages are now \emph{fused into the Legendre kernels}: the
+forward extract scatters the twiddled $F_m$ straight onto the ring FFT
+bins (\texttt{fold\_scatter}, atomicAdd), and the adjoint init gathers
+$F'_m$ from the half-spectrum $\hat G$ on the fly.  The phase array no
+longer exists in any single-transform path ($-805$\,MB spin-0 /
+$-1.6$\,GB spin-2 at $N_\mathrm{side}=2048$, plus one full memory pass in
+each direction); runtimes are unchanged within noise, as expected --- this
+was a memory optimisation.  The spin-2 adjoint reduction now runs four
+chains per lane (664$\to$596\,ms at $N_\mathrm{side}=2048$; 168 registers,
+occupancy-limited).
+
+SiMaster integration is complete short of the physics reruns:
+\texttt{almond} is an editable package and
+\texttt{CovModel}/\texttt{QMLWorkspace} accept \texttt{backend='almond'}
+(same \texttt{pure\_callback} plumbing as \texttt{'ducc'}).  The
+covariance operator $C\!\cdot\!x$ agrees between the two backends to
+$10^{-10}$ on a cut sky with mixed spin-0/spin-2 fields, and SiMaster's
+own test suite passes unchanged.
+
+\section{Roadmap}
+\label{sec:future}
+
+\begin{enumerate}
+\item \textbf{val1/val2 QML validation} with \texttt{backend='almond'}
+  (deliberately left to a SiMaster-focused follow-up).
+\item \textbf{Spin-2 adjoint reduction restructure}: SADJ\_PPT=4 is
+  register-bound; a block-level two-stage reduction could recover the
+  remaining $\sim$1.5$\times$ to parity with the forward kernel.
+\item \textbf{Batched accumulator chunking} (one recursion feeding $C$
+  columns) \emph{measured to lose} to looping the single-transform
+  pipeline (registers + L1 pressure; see \S\ref{sec:batched}).
+\end{enumerate}
+
+\end{document}

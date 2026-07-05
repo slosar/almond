@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Vendored third-party source (ducc0 checkout used only as a local reference)
+external/
+
+# Local benchmark output / logs / results
+bench/logs/
+results/
+
+# LaTeX build artifacts (keep report.tex and report.pdf)
+report/*.aux
+report/*.log
+report/*.out
+report/*.toc
+report/*.synctex.gz
+
+# Editor / OS
+*.swp
+.DS_Store
