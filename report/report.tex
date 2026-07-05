@@ -16,7 +16,8 @@
 \title{\textbf{Almond}: a GPU spherical-harmonic transform for HEALPix\\
 {\large Mathematical techniques and technical design}}
 \author{PowerSpec / SiMaster project}
-\date{July 2026 (prototype v0.1: spin-0 synthesis)}
+\date{July 2026 (v0.4: spin-0 and spin-2, synthesis and exact adjoint;
+originally prototyped for spin-0 synthesis in v0.1)}
 
 \begin{document}
 \maketitle
@@ -30,8 +31,10 @@ spectrum estimator.  It implements, on the GPU, the same
 exact algorithm as \texttt{ducc0} (the libsharp2 lineage): double precision
 throughout, healpy conventions, matrix-free, with the every-other-$\ell$
 Legendre recursion, $2^{\pm800}$ dynamic-range scaling, and per-ring FFT-bin
-aliasing.  \texttt{ducc0} is the correctness reference; the prototype
-achieves $\lesssim 10^{-11}$ maximum relative deviation from it.  This
+aliasing.  It covers spin-0 and spin-2 fields in both directions
+(synthesis and exact adjoint synthesis).  \texttt{ducc0} is the correctness
+reference; Almond achieves $\lesssim 10^{-11}$ maximum relative deviation
+from it.  This
 document derives the algorithm, records the design decisions and their
 GPU-specific rationale, and reports benchmark results on NERSC Perlmutter
 A100 nodes.
