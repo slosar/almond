@@ -7,6 +7,10 @@ name = "almond"
 version = "0.4.0"
 description = "GPU spherical harmonic transforms for HEALPix (ducc0-exact, CuPy/CUDA)"
 requires-python = ">=3.10"
+license = {file = "LICENSE"}
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
 dependencies = ["numpy", "cupy-cuda12x"]
 
 [tool.setuptools]

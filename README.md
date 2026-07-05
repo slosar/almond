@@ -1,6 +1,7 @@
 # Almond
 
 [![tests](https://github.com/slosar/almond/actions/workflows/tests.yml/badge.svg)](https://github.com/slosar/almond/actions/workflows/tests.yml)
+[![license: GPLv3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-CuPy%2012.x-76b900.svg)](https://cupy.dev/)
 
@@ -153,6 +154,13 @@ estimator regime. Known ceiling-raisers not yet done: fp64 tensor-core (DMMA)
 Legendre tiles, mask-aware ring/pair skipping for cut-sky, and a precomputed-λ
 GEMM path for nside ≤ 256. See [`SUMMARY.md`](SUMMARY.md) for the full progress
 log and benchmark tables.
+
+## License
+
+Almond is free software licensed under the **GNU General Public License,
+version 3 or later** — see [`LICENSE`](LICENSE). It implements the same
+algorithm as ducc0, which is GPLv2-or-later; GPLv3 is compatible with that
+lineage.
 
 ## References
 
