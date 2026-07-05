@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Anze Slosar and the PowerSpec/SiMaster project
+# Copyright (C) 2026 Anze Slosar
 #
 # Almond is free software: you can redistribute it and/or modify it under the
 # terms of the GNU General Public License as published by the Free Software
