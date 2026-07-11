@@ -1004,6 +1004,149 @@ class SynthesisPlan:
             self._adj_zchunk(maps[c0: c0 + nb], out[c0: c0 + nb])
         return out
 
+    # -------------------------------------------------------------- inverse
+
+    def _alm_inner_batch(self, a, b):
+        """Real-field harmonic inner product, independently per batch row."""
+        cp = self.cp
+        # In healpy's packed representation m=0 occupies the first lmax+1
+        # entries. The independent real and imaginary parts at m>0 each carry
+        # the factor two appearing in the exact synthesis-adjoint identity.
+        z = (cp.conj(a) * b).real
+        z[..., self.lmax + 1:] *= 2.0
+        return z.reshape(z.shape[0], -1).sum(axis=1)
+
+    def _canonicalize_alm_batch(self, alm):
+        """Project packed coefficients onto the real spin-s field domain."""
+        alm[..., :self.lmax + 1] = alm[..., :self.lmax + 1].real
+        if self.spin == 2:
+            # l=0,1 do not exist for a spin-2 field. In packed healpy order
+            # these are (l,m)=(0,0),(1,0),(1,1).
+            alm[..., :2] = 0.0
+            alm[..., self.lmax + 1] = 0.0
+        return alm
+
+    def inverse_device_batch(self, maps, *, epsilon=1e-10, maxiter=20,
+                             x0=None, return_info=False):
+        """Iterative inverse synthesis (least-squares analysis), batched.
+
+        This operation is intentionally distinct from :meth:`adjoint_device`.
+        It solves ``min_a ||synthesis(a) - maps||_2`` with batched CGLS using
+        Almond's exact synthesis/adjoint pair. For a band-limited input map it
+        recovers the generating coefficients to ``epsilon``; for a general
+        map it returns the Euclidean least-squares pseudoinverse, matching the
+        mathematical target of ``ducc0.sht.experimental.pseudo_analysis``.
+
+        Parameters
+        ----------
+        maps : cupy-compatible array
+            ``(B,npix)`` for spin 0 or ``(B,2,npix)`` for spin 2.
+        epsilon : float
+            Relative normal-equation residual tolerance.
+        maxiter : int
+            Maximum CGLS iterations.
+        x0 : array, optional
+            Initial packed healpy coefficients with the corresponding batch
+            shape.
+        return_info : bool
+            Also return a dictionary containing iteration count and residuals.
+        """
+        cp = self.cp
+        maps = cp.ascontiguousarray(maps, dtype=cp.float64)
+        want = (self.npix,) if self.spin == 0 else (2, self.npix)
+        if maps.ndim != len(want) + 1 or maps.shape[1:] != want:
+            raise ValueError(f"maps must be (B, {want})")
+        B = maps.shape[0]
+        ashape = (B, self.nalm) if self.spin == 0 else (B, 2, self.nalm)
+        if x0 is None:
+            x = cp.zeros(ashape, dtype=cp.complex128)
+            r = maps.copy()
+        else:
+            x = cp.ascontiguousarray(x0, dtype=cp.complex128).copy()
+            if x.shape != ashape:
+                raise ValueError(f"x0 must have shape {ashape}")
+            self._canonicalize_alm_batch(x)
+            r = maps - self.synthesis_device_batch(x)
+
+        s = self._canonicalize_alm_batch(self.adjoint_device_batch(r))
+        p = s.copy()
+        gamma = self._alm_inner_batch(s, s)
+        gamma0 = cp.maximum(gamma, cp.finfo(cp.float64).tiny)
+        tiny = cp.finfo(cp.float64).tiny
+        rel_normal = cp.sqrt(gamma / gamma0)
+        nit = 0
+
+        for nit in range(1, int(maxiter) + 1):
+            q = self.synthesis_device_batch(p)
+            delta = cp.sum(q.reshape(B, -1) ** 2, axis=1)
+            alpha = cp.where(delta > tiny, gamma / delta, 0.0)
+            expand_map = (B,) + (1,) * (maps.ndim - 1)
+            expand_alm = (B,) + (1,) * (x.ndim - 1)
+            x += alpha.reshape(expand_alm) * p
+            r -= alpha.reshape(expand_map) * q
+            s = self._canonicalize_alm_batch(self.adjoint_device_batch(r))
+            gamma_new = self._alm_inner_batch(s, s)
+            rel_normal = cp.sqrt(gamma_new / gamma0)
+            if bool(cp.all(rel_normal <= float(epsilon))):
+                gamma = gamma_new
+                break
+            beta = cp.where(gamma > tiny, gamma_new / gamma, 0.0)
+            p = s + beta.reshape(expand_alm) * p
+            gamma = gamma_new
+
+        self._canonicalize_alm_batch(x)
+        if not return_info:
+            if not bool(cp.all(rel_normal <= float(epsilon))):
+                worst = float(cp.max(rel_normal))
+                raise RuntimeError(
+                    f"inverse did not converge in {maxiter} iterations "
+                    f"(relative normal residual {worst:.3e}); increase "
+                    "maxiter, lower lmax, or pass return_info=True to inspect "
+                    "and explicitly accept an approximate solution")
+            return x
+        bnorm = cp.sqrt(cp.sum(maps.reshape(B, -1) ** 2, axis=1))
+        rnorm = cp.sqrt(cp.sum(r.reshape(B, -1) ** 2, axis=1))
+        info = {
+            "niter": nit,
+            "relative_normal_residual": rel_normal,
+            "relative_map_residual": rnorm / cp.maximum(bnorm, tiny),
+            "converged": rel_normal <= float(epsilon),
+        }
+        return x, info
+
+    def inverse_device(self, maps, *, epsilon=1e-10, maxiter=20, x0=None,
+                       return_info=False):
+        """Single-map device inverse; see :meth:`inverse_device_batch`."""
+        cp = self.cp
+        maps = cp.ascontiguousarray(maps, dtype=cp.float64)
+        x0b = None if x0 is None else cp.asarray(x0)[None]
+        result = self.inverse_device_batch(
+            maps[None], epsilon=epsilon, maxiter=maxiter, x0=x0b,
+            return_info=return_info)
+        if not return_info:
+            return result[0]
+        x, info = result
+        info = {k: (v[0] if hasattr(v, "shape") and v.shape else v)
+                for k, v in info.items()}
+        return x[0], info
+
+    def inverse(self, maps: np.ndarray, *, epsilon=1e-10, maxiter=20,
+                x0=None, return_info=False):
+        """Host convenience wrapper for iterative inverse synthesis."""
+        cp = self.cp
+        dmap = cp.asarray(np.ascontiguousarray(maps, dtype=np.float64))
+        dx0 = None if x0 is None else cp.asarray(
+            np.ascontiguousarray(x0, dtype=np.complex128))
+        result = self.inverse_device(dmap, epsilon=epsilon, maxiter=maxiter,
+                                     x0=dx0, return_info=return_info)
+        if not return_info:
+            return cp.asnumpy(result)
+        alm, info = result
+        return cp.asnumpy(alm), {
+            k: (cp.asnumpy(v) if isinstance(v, cp.ndarray) else v)
+            for k, v in info.items()
+        }
+
     def adjoint(self, maps: np.ndarray) -> np.ndarray:
         """Host convenience wrapper: numpy map in, numpy alm out."""
         cp = self.cp

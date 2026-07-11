@@ -191,6 +191,56 @@ def test_gpu_adjoint_batched():
         assert np.abs(got[b] - single).max() <= 1e-13 * np.abs(single).max()
 
 
+@pytest.mark.parametrize("spin", [0, 2])
+def test_gpu_inverse_recovers_bandlimited_coefficients(spin):
+    """The inverse is analysis/pseudoinverse, not merely the adjoint."""
+    nside, lmax, B = 16, 32, 3
+    nalm = (lmax + 1) * (lmax + 2) // 2
+    rng = np.random.default_rng(701 + spin)
+    shape = (B, nalm) if spin == 0 else (B, 2, nalm)
+    alm = rng.standard_normal(shape) + 1j * rng.standard_normal(shape)
+    alm[..., :lmax + 1] = alm[..., :lmax + 1].real
+    if spin == 2:
+        alm[..., :2] = 0.0
+        alm[..., lmax + 1] = 0.0
+    plan = SynthesisPlan(nside, lmax, spin=spin)
+    d_alm = cupy.asarray(alm)
+    maps = plan.synthesis_device_batch(d_alm)
+    got, info = plan.inverse_device_batch(
+        maps, epsilon=1e-11, maxiter=30, return_info=True)
+    got = cupy.asnumpy(got)
+    rel = np.linalg.norm((got - alm).ravel()) / np.linalg.norm(alm.ravel())
+    assert rel < 2e-9
+    assert bool(cupy.all(info["converged"]))
+    assert float(cupy.max(info["relative_map_residual"])) < 2e-10
+
+
+def test_dlpack_jax_cupy_zero_copy_roundtrip():
+    """JAX and CuPy view the same allocation, with no host staging."""
+    import jax
+    import jax.numpy as jnp
+    from almond.interop import as_cupy, as_jax
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("requires JAX CUDA backend")
+    jax.config.update("jax_enable_x64", True)
+    x = jnp.arange(32, dtype=jnp.float64)
+    c = as_cupy(x)
+    assert c.data.ptr == x.unsafe_buffer_pointer()
+    y = as_jax(c)
+    assert y.unsafe_buffer_pointer() == c.data.ptr
+    np.testing.assert_array_equal(np.asarray(y), np.arange(32))
+
+
+def test_inverse_reports_nonconvergence():
+    nside, lmax = 8, 12
+    plan = SynthesisPlan(nside, lmax)
+    alm = cupy.asarray(random_alm(lmax, 909))
+    maps = plan.synthesis_device(alm)
+    with pytest.raises(RuntimeError, match="did not converge"):
+        plan.inverse_device(maps, epsilon=1e-30, maxiter=0)
+
+
 def ducc_spin2(alm2, nside, lmax, adjoint=False, maps=None, nthreads=8):
     base = ducc0.healpix.Healpix_Base(nside, "RING")
     geom = base.sht_info()

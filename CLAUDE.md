@@ -211,6 +211,17 @@ plus single-mode/m-range bisection against ducc.
 
 ## Known limitations / next steps
 
+- **SiMaster callback boundary fixed in v0.5/SiMaster 0.2.** DLPack shares
+  JAX/CuPy allocations at solve entry/exit; covariance, preconditioner, and
+  batched PCG remain in CuPy between them. At nside=128/lmax=383/B=4 this made
+  one covariance apply 14.2x faster and a converged 20-iteration solve 6.43x
+  faster. Observed-pixel indexing was already on-device and is now an explicit
+  tested API contract.
+- `inverse*` is a CGLS synthesis pseudoinverse, distinct from `adjoint*`.
+  At nside=128/lmax=191 it agrees with ducc `pseudo_analysis` below 2e-13 and
+  is 7.5--8.1x faster. The lmax=3*nside-1 inverse is intrinsically poorly
+  conditioned in both libraries; inspect `return_info`/increase `maxiter`.
+
 - fold/unfold are fused into the Legendre kernels (v0.3) — no phase array
   in single-transform paths; the chunked batch path (chunk>1) still uses
   one, and remains slower than looping singles (kept for experiments).

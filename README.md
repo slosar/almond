@@ -18,14 +18,17 @@ workload.
 
 ## Highlights
 
-- **Spin-0 and spin-2**, both **synthesis** (`alm → map`) and **exact adjoint
-  synthesis** (`map → alm`, i.e. Yᵀ). No dense matrices, no pixel covariance.
+- **Spin-0 and spin-2**, with **synthesis** (`alm → map`), its **exact adjoint**
+  (`map → alm`, i.e. Yᵀ), and an iterative **inverse/least-squares analysis**
+  (`map → alm`, i.e. Y⁺). The inverse is not conflated with Yᵀ.
 - **float64 throughout**, healpy triangular-`alm` conventions, validated
   against ducc0 to ~1e-12 on random `alm` (accuracy gate: max relative error
   < 1e-10).
 - **Grid-batched columns** for the many-transform regime (e.g. CG / Monte
   Carlo), plus `AlmondRealSHT`, a drop-in for SiMaster's real-basis cut-sky
   `RealSHT`.
+- **Zero-copy JAX/CuPy interoperation** through DLPack; cut-sky observed-pixel
+  gather/scatter remains on the GPU.
 - **Pure CuPy + NVRTC** — no build system; kernels compile at import.
 
 ## Performance
@@ -43,6 +46,13 @@ Batched (many columns per call) vs ducc0's `ntrans` mode, per column — at
 nside 128 (a typical estimator scale) Almond is **~10× faster spin-0 and ~7×
 faster spin-2**, in both directions. Numbers in parentheses are the speedup
 over ducc0; full tables and methodology are in [`SUMMARY.md`](SUMMARY.md).
+
+The v0.5 iterative inverse is also batched. On an A100 at nside 128,
+lmax 191 and B=4 it is **7.5× faster for spin-0 and 8.1× for spin-2** than
+ducc0 `pseudo_analysis` on 64 CPU threads; both converge in five iterations
+and agree below 2e-13. At lmax=3*nside−1 the inverse is poorly conditioned in
+both libraries and may need hundreds of iterations; Almond reports convergence
+and raises rather than silently returning an unconverged default result.
 
 ## Install
 
@@ -68,9 +78,14 @@ import almond
 plan = almond.SynthesisPlan(nside=1024, lmax=3071)
 m = plan.synthesis(alm)                  # numpy in -> numpy out
 a = plan.adjoint(m)                      # exact Y^T (ducc convention)
+ainv = plan.inverse(m, epsilon=1e-10)    # least-squares inverse Y^+
 
 # stay on the device (no host copies)
 m_d = plan.synthesis_device(alm_cupy)
+
+# zero-copy views of existing JAX/CuPy device allocations
+a_cupy = almond.as_cupy(a_jax)
+a_jax_again = almond.as_jax(a_cupy)
 
 # spin-2: (aE, aB) <-> (Q, U); l < 2 modes must be zero
 plan2 = almond.SynthesisPlan(nside=1024, lmax=3071, spin=2)
@@ -148,8 +163,9 @@ almond/
 
 ## Status
 
-v0.4. Spin-0/2 synthesis and exact adjoint are complete and validated;
-adjoints run at parity with synthesis and batched throughput is tuned for the
+v0.5. Spin-0/2 synthesis, exact adjoint, and iterative inverse are complete;
+JAX/CuPy DLPack interoperation supports device-resident SiMaster solves.
+Adjoints run at parity with synthesis and batched throughput is tuned for the
 estimator regime. Known ceiling-raisers not yet done: fp64 tensor-core (DMMA)
 Legendre tiles, mask-aware ring/pair skipping for cut-sky, and a precomputed-λ
 GEMM path for nside ≤ 256. See [`SUMMARY.md`](SUMMARY.md) for the full progress

@@ -11,10 +11,11 @@ Minimal, exact (float64), healpy-compatible conventions.  Reference
 implementation: ducc0.  Prototype scope: spin-0 synthesis.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .geometry import ring_geometry, pair_geometry
 from . import reference
+from .interop import as_cupy, as_jax
 
 
 def __getattr__(name):
@@ -26,4 +27,4 @@ def __getattr__(name):
 
 
 __all__ = ["ring_geometry", "pair_geometry", "reference", "SynthesisPlan",
-           "__version__"]
+           "as_cupy", "as_jax", "__version__"]

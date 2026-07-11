@@ -18,6 +18,7 @@ from __future__ import annotations
 import numpy as np
 
 from .plan import SynthesisPlan
+from .interop import as_cupy, is_host_array
 
 
 class AlmondRealSHT:
@@ -96,7 +97,7 @@ class AlmondRealSHT:
     def synth(self, a):
         """a: (ncol, B) -> observed-pixel maps (nrow, B)."""
         cp = self.cp
-        a_d = cp.asarray(a, dtype=cp.float64)
+        a_d = as_cupy(a, dtype=cp.float64)
         B = a_d.shape[-1]
         aT = cp.ascontiguousarray(a_d.T).reshape(B, self.ncomp, self.K)
         out = cp.empty((self.nrow, B), dtype=cp.float64)
@@ -112,12 +113,12 @@ class AlmondRealSHT:
                 out[:, c0: c0 + nb] = \
                     mp[:, :, self.d_obs].reshape(nb, self.nrow).T
             del alm, mp
-        return out.get() if isinstance(a, np.ndarray) else out
+        return out.get() if is_host_array(a) else out
 
     def adjoint(self, maps):
         """maps: (nrow, B) -> coefficients (ncol, B); exact transpose."""
         cp = self.cp
-        m_d = cp.asarray(maps, dtype=cp.float64)
+        m_d = as_cupy(maps, dtype=cp.float64)
         B = m_d.shape[-1]
         mT = cp.ascontiguousarray(m_d.T).reshape(B, self.ncomp, self.nobs)
         out = cp.empty((self.ncol, B), dtype=cp.float64)
@@ -136,4 +137,17 @@ class AlmondRealSHT:
             out[:, c0: c0 + nb] = \
                 self._healpy_to_real_b(alm).reshape(nb, self.ncol).T
             del alm
-        return out.get() if isinstance(maps, np.ndarray) else out
+        return out.get() if is_host_array(maps) else out
+
+    # Explicit names make the no-host-copy contract discoverable to callers.
+    # ``synth``/``adjoint`` remain backward-compatible and dispatch by input
+    # type, while these methods always return CuPy arrays.
+    def synth_device(self, a):
+        """Device-resident synthesis from CuPy/JAX/DLPack-compatible input."""
+        out = self.synth(as_cupy(a, dtype=self.cp.float64))
+        return as_cupy(out, dtype=self.cp.float64)
+
+    def adjoint_device(self, maps):
+        """Device-resident exact adjoint from CuPy/JAX/DLPack input."""
+        out = self.adjoint(as_cupy(maps, dtype=self.cp.float64))
+        return as_cupy(out, dtype=self.cp.float64)

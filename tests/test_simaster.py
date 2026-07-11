@@ -7,7 +7,11 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, "/global/u1/a/anze/PowerSpec/SiMaster")
+# In the coordinated NG checkout, prefer the sibling SiMaster branch. In a
+# standalone Almond checkout, use whichever simaster is installed/PYTHONPATH.
+_sibling_simaster = Path(__file__).resolve().parents[2] / "SiMaster"
+if _sibling_simaster.exists():
+    sys.path.insert(0, str(_sibling_simaster))
 
 cupy = pytest.importorskip("cupy")
 simaster = pytest.importorskip("simaster")
@@ -79,6 +83,21 @@ def test_covmodel_backend_alm_vs_ducc():
     y_a = np.asarray(cov_a.apply_C(x))
     err = np.abs(y_a - y_d).max() / np.abs(y_d).max()
     assert err < 1e-10, f"apply_C backend mismatch: {err:.2e}"
+
+
+def test_observed_pixel_ops_remain_device_resident():
+    """Cut-sky gather/scatter accept and return CuPy without host arrays."""
+    nside, lmax, B = 8, 20, 3
+    npix = 12 * nside ** 2
+    obs = np.sort(np.random.default_rng(12).choice(npix, npix // 2,
+                                                   replace=False))
+    index = RealAlmIndex(2, lmax)
+    op = AlmondRealSHT(nside, index, 0, obs)
+    a = cupy.asarray(np.random.default_rng(13).standard_normal((op.ncol, B)))
+    m = op.synth_device(a)
+    at = op.adjoint_device(m)
+    assert isinstance(m, cupy.ndarray) and isinstance(at, cupy.ndarray)
+    assert m.shape == (op.nrow, B) and at.shape == (op.ncol, B)
 
 
 if __name__ == "__main__":

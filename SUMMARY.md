@@ -351,3 +351,22 @@ spin-0 / ~7× spin-2, both directions.
   into legendre kernel (also removes a full memory pass).
 - Plan-time coef table build: trivial. Plan persistent buffers at
   nside=2048: ~2.5 GB (see report §Memory).
+
+## 2026-07-11 (v0.5) — inverse analysis and device-resident SiMaster CG
+
+Added zero-copy JAX/CuPy DLPack interop, explicit device entry points for
+`AlmondRealSHT`, and a batched CGLS synthesis inverse/pseudoinverse distinct
+from the exact adjoint. SiMaster 0.2 now runs the full Almond-backed covariance,
+Woodbury preconditioner, and PCG loop in CuPy, crossing JAX/CuPy only once at
+each solve boundary rather than twice per SHT per iteration.
+
+NERSC job 55803530, A100-SXM4-40GB, nside=128/lmax=383/B=4: covariance apply
+59.46→4.183 ms (**14.2x**); converged 20-iteration PCG 1.200→0.1867 s
+(**6.43x**). Operator and solution relative differences are 4.9e-18 and
+2.1e-16. At nside=128/lmax=191/B=4 the inverse beats 64-thread ducc0 by
+7.46x (spin 0) / 8.10x (spin 2), converges in the same five iterations, and
+agrees below 2e-13. At lmax=383 both Almond and ducc remain unconverged after
+300 iterations; v0.5 raises on non-convergence unless info is requested.
+
+Validation: 43 non-slow GPU tests + 17 CPU reference + 6 cut-sky integration
+tests pass; SiMaster's device operator/PCG and full exact-Fisher QML smoke pass.
